@@ -65,11 +65,11 @@ Dependabot-Alerts/
 
 | # | Decision | Answer |
 |---|----------|--------|
-| Q19 | Trigger | GitHub Actions `dependabot_alert: [created]` event |
+| Q19 | Trigger | `schedule` (cron every 6h) + `workflow_dispatch` — `dependabot_alert` is webhook-only, not a valid Actions trigger |
 | Q20 | Scope | Critical/high severity, direct deps only, known patched version required |
 | Q21 | Approval | Fully autonomous PR creation (PR is the review gate) |
 | Q22 | Location | Reusable workflow in this repo, called via `uses:` |
-| Q23 | Auth | `GITHUB_TOKEN` with `security_events: read`, `contents: write`, `pull-requests: write` |
+| Q23 | Auth | `GITHUB_TOKEN` with `contents: write`, `pull-requests: write` (Dependabot alerts readable via `github-script` with default token) |
 | Q24 | Runtime in CI | Install dynamically per ecosystem (`actions/setup-node`, etc.) |
 | Q25 | Inputs | Severity filter (default: critical,high) and extra PR labels |
 | Q26 | Auto-merge | No — PR is the human review point |
@@ -83,7 +83,7 @@ Dependabot-Alerts/
 - `dependency.scope` field: `runtime` | `development` | `null`
 - No "existing PR" field in alert API — detection requires separate `gh pr list`
 - Alerts can be dismissed via `PATCH` with reason, but we leave them open (auto-resolve on merge)
-- `dependabot_alert` event (not the deprecated `repository_vulnerability_alert`) — workflow must be on default branch
+- Neither `dependabot_alert` nor `repository_vulnerability_alert` is a valid GitHub Actions trigger — they are webhook-only events. Auto-fix uses `schedule` + `workflow_dispatch` instead
 
 ## Files to Create
 
@@ -196,13 +196,15 @@ permissions:
 
 ### Automated
 ```
-dependabot_alert event fires
-  → reusable workflow triggers
+schedule (every 6h) or workflow_dispatch
+  → fetch all open alerts via API
   → filter: critical/high + direct + has patched version
-  → install ecosystem runtime
-  → bump manifest to minimum patched version
-  → regenerate lockfile
-  → commit, push, create PR
+  → deduplicate by package
+  → skip if fix branch/PR already exists
+  → for each eligible package:
+      → create branch, bump manifest
+      → commit, push, create PR
+  → summary of succeeded/failed/skipped
 ```
 
 ## Verification

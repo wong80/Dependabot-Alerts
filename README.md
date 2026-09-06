@@ -48,24 +48,27 @@ The skill walks you through:
 
 ### Automated: GitHub Actions workflow
 
-Add this workflow to any repo to auto-fix qualifying alerts the moment they appear:
+Add this workflow to any repo to auto-fix qualifying alerts on a schedule (every 6 hours) or on demand:
 
 ```yaml
 # .github/workflows/dependabot-auto-fix.yml
 name: Dependabot Auto-Fix
 on:
-  dependabot_alert:
-    types: [created]
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
 jobs:
   fix:
     uses: wong80/Dependabot-Alerts/.github/workflows/auto-fix-alert.yml@main
 ```
 
 **What it does:**
-- Triggers on new Dependabot alerts
+- Runs every 6 hours (or manually via `workflow_dispatch`)
+- Fetches all open Dependabot alerts via the API
 - Filters to critical/high severity, direct dependencies, with a known patched version
-- Installs the ecosystem runtime (Node.js, Python, Go, etc.)
+- Deduplicates by package (one PR per package, resolving multiple alerts)
 - Bumps the dependency to the minimum safe version
+- Skips packages that already have a fix branch or PR open
 - Creates a PR automatically
 
 **Customization** via workflow inputs:

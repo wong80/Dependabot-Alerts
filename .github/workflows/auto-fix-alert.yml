@@ -1,4 +1,4 @@
-name: Auto-fix Dependabot Alert
+name: Auto-fix Dependabot Alerts
 
 on:
   workflow_call:
@@ -13,11 +13,22 @@ on:
         required: false
         type: string
         default: ""
-  dependabot_alert:
-    types: [created]
+  workflow_dispatch:
+    inputs:
+      severity-filter:
+        description: "Comma-separated severities to auto-fix"
+        required: false
+        type: string
+        default: "critical,high"
+      extra-labels:
+        description: "Comma-separated extra labels to add to the PR"
+        required: false
+        type: string
+        default: ""
+  schedule:
+    - cron: "0 */6 * * *"
 
 permissions:
-  security_events: read
   contents: write
   pull-requests: write
 
@@ -29,337 +40,272 @@ jobs:
   auto-fix:
     runs-on: ubuntu-latest
     steps:
-      - name: Get alert details
-        id: alert
+      - name: Fetch open alerts
+        id: alerts
         uses: actions/github-script@v7
         with:
           script: |
-            const alert = context.payload.alert;
-            if (!alert) {
-              core.setFailed('No alert in event payload — this workflow must be triggered by a dependabot_alert event.');
+            const filter = '${{ inputs.severity-filter || 'critical,high' }}'.toLowerCase().split(',').map(s => s.trim());
+            const extraLabels = '${{ inputs.extra-labels }}'.split(',').map(s => s.trim()).filter(Boolean);
+
+            const alerts = await github.paginate(github.rest.dependabot.listAlertsForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+
+            const eligible = alerts.filter(a => {
+              const severity = a.security_vulnerability.severity.toLowerCase();
+              const relationship = a.dependency.relationship;
+              const patched = a.security_vulnerability.first_patched_version;
+              return filter.includes(severity) && relationship === 'direct' && patched !== null;
+            });
+
+            if (eligible.length === 0) {
+              core.info('No eligible alerts found.');
+              core.setOutput('count', '0');
               return;
             }
 
-            const severity = alert.security_vulnerability.severity;
-            const relationship = alert.dependency.relationship;
-            const patchedVersion = alert.security_vulnerability.first_patched_version;
-            const pkg = alert.dependency.package;
-            const manifest = alert.dependency.manifest_path;
+            // Deduplicate by package — keep the alert needing the highest patched version
+            const byPackage = {};
+            for (const alert of eligible) {
+              const pkg = alert.dependency.package.name;
+              if (!byPackage[pkg] || alert.number > byPackage[pkg].number) {
+                byPackage[pkg] = alert;
+              }
+            }
 
-            core.setOutput('number', alert.number);
-            core.setOutput('severity', severity);
-            core.setOutput('relationship', relationship || 'unknown');
-            core.setOutput('package_name', pkg.name);
-            core.setOutput('ecosystem', pkg.ecosystem);
-            core.setOutput('manifest_path', manifest);
-            core.setOutput('patched_version', patchedVersion ? patchedVersion.identifier : '');
-            core.setOutput('vulnerable_range', alert.security_vulnerability.vulnerable_version_range);
-            core.setOutput('ghsa_id', alert.security_advisory.ghsa_id);
-            core.setOutput('summary', alert.security_advisory.summary);
+            const deduped = Object.values(byPackage);
+            core.setOutput('count', String(deduped.length));
+            core.setOutput('alerts', JSON.stringify(deduped.map(a => ({
+              number: a.number,
+              severity: a.security_vulnerability.severity,
+              package_name: a.dependency.package.name,
+              ecosystem: a.dependency.package.ecosystem,
+              manifest_path: a.dependency.manifest_path,
+              patched_version: a.security_vulnerability.first_patched_version.identifier,
+              vulnerable_range: a.security_vulnerability.vulnerable_version_range,
+              ghsa_id: a.security_advisory.ghsa_id,
+              summary: a.security_advisory.summary
+            }))));
+            core.setOutput('extra_labels', JSON.stringify(extraLabels));
 
-      - name: Check eligibility
-        id: eligible
-        run: |
-          SEVERITY="${{ steps.alert.outputs.severity }}"
-          RELATIONSHIP="${{ steps.alert.outputs.relationship }}"
-          PATCHED="${{ steps.alert.outputs.patched_version }}"
-          FILTER="${{ inputs.severity-filter || 'critical,high' }}"
-
-          # Check severity filter
-          if ! echo "$FILTER" | grep -qi "$SEVERITY"; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "reason=Severity '$SEVERITY' not in filter '$FILTER'" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Check relationship (direct only)
-          if [ "$RELATIONSHIP" != "direct" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "reason=Transitive dependency — skipping auto-fix" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Check patched version exists
-          if [ -z "$PATCHED" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "reason=No patched version available" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-
-      - name: Skip notification
-        if: steps.eligible.outputs.skip == 'true'
-        run: |
-          echo "::notice::Skipping alert #${{ steps.alert.outputs.number }}: ${{ steps.eligible.outputs.reason }}"
+            core.info(`Found ${deduped.length} eligible alerts (${eligible.length} total, deduplicated by package).`);
 
       - name: Checkout repository
-        if: steps.eligible.outputs.skip != 'true'
+        if: steps.alerts.outputs.count != '0'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Determine branch name
-        if: steps.eligible.outputs.skip != 'true'
-        id: branch
-        run: |
-          ECOSYSTEM="${{ steps.alert.outputs.ecosystem }}"
-          PACKAGE="${{ steps.alert.outputs.package_name }}"
-          # Sanitize package name for branch (replace / with -)
-          SAFE_PACKAGE=$(echo "$PACKAGE" | tr '/' '-')
-          BRANCH="dependabot/${ECOSYSTEM}/${SAFE_PACKAGE}"
-
-          # Check if branch exists on remote
-          if git ls-remote --heads origin "$BRANCH" | grep -q .; then
-            BRANCH="${BRANCH}-fix"
-          fi
-
-          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
-
-      - name: Create fix branch
-        if: steps.eligible.outputs.skip != 'true'
-        run: |
-          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
-          git checkout -b "${{ steps.branch.outputs.name }}" "origin/${DEFAULT_BRANCH}"
-
-      - name: Setup Node.js
-        if: steps.eligible.outputs.skip != 'true' && steps.alert.outputs.ecosystem == 'npm'
-        uses: actions/setup-node@v4
-        with:
-          node-version: 'lts/*'
-
-      - name: Setup Python
-        if: steps.eligible.outputs.skip != 'true' && steps.alert.outputs.ecosystem == 'pip'
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: Setup Go
-        if: steps.eligible.outputs.skip != 'true' && steps.alert.outputs.ecosystem == 'gomod'
-        uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
-
-      - name: Setup .NET
-        if: steps.eligible.outputs.skip != 'true' && steps.alert.outputs.ecosystem == 'nuget'
-        uses: actions/setup-dotnet@v4
-
-      - name: Setup Ruby
-        if: steps.eligible.outputs.skip != 'true' && steps.alert.outputs.ecosystem == 'rubygems'
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: 'ruby'
-
-      - name: Setup Java (Maven)
-        if: steps.eligible.outputs.skip != 'true' && steps.alert.outputs.ecosystem == 'maven'
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: Apply fix
-        if: steps.eligible.outputs.skip != 'true'
-        id: fix
+      - name: Process alerts
+        if: steps.alerts.outputs.count != '0'
         uses: actions/github-script@v7
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
           script: |
+            const { execSync } = require('fs') ? require('child_process') : {};
             const fs = require('fs');
-            const path = require('path');
-            const { execSync } = require('child_process');
-
-            const ecosystem = '${{ steps.alert.outputs.ecosystem }}';
-            const pkg = '${{ steps.alert.outputs.package_name }}';
-            const patchedVersion = '${{ steps.alert.outputs.patched_version }}';
-            const manifestPath = '${{ steps.alert.outputs.manifest_path }}';
+            const alerts = JSON.parse('${{ steps.alerts.outputs.alerts }}'.replace(/'/g, "'"));
+            const extraLabels = JSON.parse('${{ steps.alerts.outputs.extra_labels }}'.replace(/'/g, "'"));
 
             const run = (cmd) => {
               console.log(`> ${cmd}`);
               try {
                 return execSync(cmd, { encoding: 'utf8', stdio: 'pipe' });
               } catch (e) {
-                console.log(`Command failed: ${e.message}`);
+                console.log(`Command failed: ${e.stderr || e.message}`);
                 return null;
               }
             };
 
-            let currentVersion = 'unknown';
+            const defaultBranch = '${{ github.event.repository.default_branch }}' || 'main';
+            const results = { succeeded: [], failed: [], skipped: [] };
 
-            switch (ecosystem) {
-              case 'npm': {
-                const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-                for (const section of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
-                  if (manifest[section] && manifest[section][pkg]) {
-                    const existing = manifest[section][pkg];
-                    currentVersion = existing.replace(/^[\^~>=<\s]+/, '');
-                    const prefix = existing.match(/^([\^~])/)?.[1] || '^';
-                    manifest[section][pkg] = `${prefix}${patchedVersion}`;
+            for (const alert of alerts) {
+              const { package_name: pkg, ecosystem, manifest_path, patched_version, number, ghsa_id, summary, severity } = alert;
+              const safePkg = pkg.replace(/\//g, '-');
+              let branch = `dependabot/${ecosystem}/${safePkg}`;
+
+              console.log(`\n--- Processing: ${pkg} → ${patched_version} (alert #${number}) ---`);
+
+              try {
+                // Check if branch already exists (fix already in progress)
+                const remoteBranch = run(`git ls-remote --heads origin ${branch}`);
+                if (remoteBranch && remoteBranch.trim()) {
+                  const fixBranch = `${branch}-fix`;
+                  const remoteFixBranch = run(`git ls-remote --heads origin ${fixBranch}`);
+                  if (remoteFixBranch && remoteFixBranch.trim()) {
+                    console.log(`Branches ${branch} and ${fixBranch} both exist — skipping.`);
+                    results.skipped.push({ pkg, reason: 'fix branch already exists' });
+                    continue;
                   }
+                  branch = fixBranch;
                 }
-                fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
-                run('npm install');
-                break;
-              }
 
-              case 'pip': {
-                let content = fs.readFileSync(manifestPath, 'utf8');
-                const regex = new RegExp(`^(${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})([=<>!~]+)(.+)$`, 'mi');
-                const match = content.match(regex);
-                if (match) {
-                  currentVersion = match[3].trim();
-                  content = content.replace(regex, `$1>=${patchedVersion}`);
-                  fs.writeFileSync(manifestPath, content);
+                // Check if a PR already exists for this package
+                const prs = await github.rest.pulls.list({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'open',
+                  head: `${context.repo.owner}:${branch}`
+                });
+                if (prs.data.length > 0) {
+                  console.log(`PR #${prs.data[0].number} already exists for ${branch} — skipping.`);
+                  results.skipped.push({ pkg, reason: `PR #${prs.data[0].number} exists` });
+                  continue;
                 }
-                break;
-              }
 
-              case 'gomod': {
-                let content = fs.readFileSync(manifestPath, 'utf8');
-                const regex = new RegExp(`(${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})\\s+(v[\\d.]+)`, 'm');
-                const match = content.match(regex);
-                if (match) {
-                  currentVersion = match[2];
-                }
-                run(`go get ${pkg}@v${patchedVersion}`);
-                run('go mod tidy');
-                break;
-              }
+                // Create branch
+                run(`git checkout -B ${branch} origin/${defaultBranch}`);
 
-              case 'cargo': {
-                let content = fs.readFileSync(manifestPath, 'utf8');
-                const regex = new RegExp(`(${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*=\\s*(?:{[^}]*version\\s*=\\s*)?")([\\d.]+)(")`);
-                const match = content.match(regex);
-                if (match) {
-                  currentVersion = match[2];
-                  content = content.replace(regex, `$1${patchedVersion}$3`);
-                  fs.writeFileSync(manifestPath, content);
-                }
-                run(`cargo update -p ${pkg}`);
-                break;
-              }
+                // Apply fix based on ecosystem
+                let currentVersion = 'unknown';
 
-              case 'composer': {
-                const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-                for (const section of ['require', 'require-dev']) {
-                  if (manifest[section] && manifest[section][pkg]) {
-                    currentVersion = manifest[section][pkg].replace(/^[\^~>=<\s]+/, '');
-                    manifest[section][pkg] = `^${patchedVersion}`;
+                if (ecosystem === 'npm') {
+                  const manifest = JSON.parse(fs.readFileSync(manifest_path, 'utf8'));
+                  for (const section of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+                    if (manifest[section] && manifest[section][pkg]) {
+                      const existing = manifest[section][pkg];
+                      currentVersion = existing.replace(/^[\^~>=<\s]+/, '');
+                      const prefix = existing.match(/^([\^~])/)?.[1] || '^';
+                      manifest[section][pkg] = `${prefix}${patched_version}`;
+                    }
                   }
+                  fs.writeFileSync(manifest_path, JSON.stringify(manifest, null, 2) + '\n');
+                  run('npm install');
+                } else if (ecosystem === 'pip') {
+                  let content = fs.readFileSync(manifest_path, 'utf8');
+                  const regex = new RegExp(`^(${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})([=<>!~]+)(.+)$`, 'mi');
+                  const match = content.match(regex);
+                  if (match) {
+                    currentVersion = match[3].trim();
+                    content = content.replace(regex, `$1==${patched_version}`);
+                    fs.writeFileSync(manifest_path, content);
+                  }
+                } else if (ecosystem === 'gomod') {
+                  let content = fs.readFileSync(manifest_path, 'utf8');
+                  const regex = new RegExp(`(${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})\\s+(v[\\d.]+)`, 'm');
+                  const match = content.match(regex);
+                  if (match) currentVersion = match[2];
+                  run(`go get ${pkg}@v${patched_version}`);
+                  run('go mod tidy');
+                } else if (ecosystem === 'nuget') {
+                  let content = fs.readFileSync(manifest_path, 'utf8');
+                  const regex = new RegExp(`(<PackageReference\\s+Include="${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\s+Version=")([^"]+)(")`);
+                  const match = content.match(regex);
+                  if (match) {
+                    currentVersion = match[2];
+                    content = content.replace(regex, `$1${patched_version}$3`);
+                    fs.writeFileSync(manifest_path, content);
+                  }
+                  run('dotnet restore');
+                } else if (ecosystem === 'github_actions') {
+                  let content = fs.readFileSync(manifest_path, 'utf8');
+                  const regex = new RegExp(`(uses:\\s*${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}@)(\\S+)`);
+                  const match = content.match(regex);
+                  if (match) {
+                    currentVersion = match[2];
+                    const major = patched_version.split('.')[0];
+                    content = content.replace(regex, `$1v${major}`);
+                    fs.writeFileSync(manifest_path, content);
+                  }
+                } else {
+                  console.log(`Unsupported ecosystem: ${ecosystem} — skipping.`);
+                  results.skipped.push({ pkg, reason: `unsupported ecosystem: ${ecosystem}` });
+                  run(`git checkout ${defaultBranch}`);
+                  continue;
                 }
-                fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 4) + '\n');
-                run('composer update --lock');
-                break;
+
+                // Check if anything changed
+                const diff = run('git diff --name-only');
+                if (!diff || !diff.trim()) {
+                  console.log('No changes detected — skipping.');
+                  results.skipped.push({ pkg, reason: 'no changes after update' });
+                  run(`git checkout ${defaultBranch}`);
+                  continue;
+                }
+
+                // Commit and push
+                run('git config user.name "github-actions[bot]"');
+                run('git config user.email "41898282+github-actions[bot]@users.noreply.github.com"');
+                run('git add -A');
+
+                const commitMsg = currentVersion !== 'unknown'
+                  ? `Bump ${pkg} from ${currentVersion} to ${patched_version}`
+                  : `Bump ${pkg} to ${patched_version}`;
+                run(`git commit -m "${commitMsg}"`);
+                run(`git push -u origin ${branch}`);
+
+                // Create PR
+                const title = commitMsg;
+                const labels = ['dependencies', ...extraLabels].filter(Boolean);
+                const body = [
+                  `Fixes Dependabot alert #${number}.`,
+                  '',
+                  `**${severity}**: ${summary}`,
+                  '',
+                  `Bumps [${pkg}](https://github.com/advisories/${ghsa_id}) to \`${patched_version}\`.`,
+                  '',
+                  '---',
+                  `*Created automatically by [auto-fix-alert](https://github.com/${context.repo.owner}/${context.repo.repo}) workflow.*`
+                ].join('\n');
+
+                try {
+                  const pr = await github.rest.pulls.create({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    title,
+                    body,
+                    head: branch,
+                    base: defaultBranch
+                  });
+
+                  // Try to add labels (don't fail if label doesn't exist)
+                  try {
+                    await github.rest.issues.addLabels({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: pr.data.number,
+                      labels
+                    });
+                  } catch (e) {
+                    console.log(`Could not add labels: ${e.message}`);
+                  }
+
+                  console.log(`PR created: ${pr.data.html_url}`);
+                  results.succeeded.push({ pkg, pr_url: pr.data.html_url, from: currentVersion, to: patched_version });
+                } catch (e) {
+                  console.log(`PR creation failed: ${e.message}`);
+                  results.failed.push({ pkg, error: e.message });
+                }
+              } catch (e) {
+                console.log(`Failed to fix ${pkg}: ${e.message}`);
+                results.failed.push({ pkg, error: e.message });
               }
 
-              case 'nuget': {
-                let content = fs.readFileSync(manifestPath, 'utf8');
-                const regex = new RegExp(`(<PackageReference\\s+Include="${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\s+Version=")([^"]+)(")`);
-                const match = content.match(regex);
-                if (match) {
-                  currentVersion = match[2];
-                  content = content.replace(regex, `$1${patchedVersion}$3`);
-                  fs.writeFileSync(manifestPath, content);
-                }
-                run('dotnet restore');
-                break;
-              }
-
-              case 'rubygems': {
-                let content = fs.readFileSync(manifestPath, 'utf8');
-                const regex = new RegExp(`(gem\\s+['"]${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]\\s*,\\s*['"][~>=<]+\\s*)([\\d.]+)(['"])`);
-                const match = content.match(regex);
-                if (match) {
-                  currentVersion = match[2];
-                  content = content.replace(regex, `$1${patchedVersion}$3`);
-                  fs.writeFileSync(manifestPath, content);
-                }
-                run('bundle install');
-                break;
-              }
-
-              case 'github-actions': {
-                let content = fs.readFileSync(manifestPath, 'utf8');
-                const regex = new RegExp(`(uses:\\s*${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}@)(\\S+)`);
-                const match = content.match(regex);
-                if (match) {
-                  currentVersion = match[2];
-                  const major = patchedVersion.split('.')[0];
-                  content = content.replace(regex, `$1v${major}`);
-                  fs.writeFileSync(manifestPath, content);
-                }
-                break;
-              }
-
-              default:
-                core.setFailed(`Unsupported ecosystem: ${ecosystem}`);
-                return;
+              // Return to default branch for next iteration
+              run(`git checkout ${defaultBranch}`);
             }
 
-            core.setOutput('current_version', currentVersion);
+            // Summary
+            console.log('\n=== SUMMARY ===');
+            console.log(`Succeeded: ${results.succeeded.length}`);
+            for (const r of results.succeeded) {
+              console.log(`  ${r.pkg} ${r.from} → ${r.to}: ${r.pr_url}`);
+            }
+            console.log(`Failed: ${results.failed.length}`);
+            for (const r of results.failed) {
+              console.log(`  ${r.pkg}: ${r.error}`);
+            }
+            console.log(`Skipped: ${results.skipped.length}`);
+            for (const r of results.skipped) {
+              console.log(`  ${r.pkg}: ${r.reason}`);
+            }
 
-      - name: Commit and push
-        if: steps.eligible.outputs.skip != 'true'
-        run: |
-          PACKAGE="${{ steps.alert.outputs.package_name }}"
-          PATCHED="${{ steps.alert.outputs.patched_version }}"
-          CURRENT="${{ steps.fix.outputs.current_version }}"
-          BRANCH="${{ steps.branch.outputs.name }}"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add -A
-          if git diff --cached --quiet; then
-            echo "::warning::No changes to commit — the dependency may already be at the patched version."
-            echo "no_changes=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ "$CURRENT" != "unknown" ]; then
-            git commit -m "Bump ${PACKAGE} from ${CURRENT} to ${PATCHED}"
-          else
-            git commit -m "Bump ${PACKAGE} to ${PATCHED}"
-          fi
-
-          git push -u origin "$BRANCH"
-
-      - name: Create pull request
-        if: steps.eligible.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          PACKAGE="${{ steps.alert.outputs.package_name }}"
-          PATCHED="${{ steps.alert.outputs.patched_version }}"
-          CURRENT="${{ steps.fix.outputs.current_version }}"
-          ALERT_NUM="${{ steps.alert.outputs.number }}"
-          SEVERITY="${{ steps.alert.outputs.severity }}"
-          GHSA="${{ steps.alert.outputs.ghsa_id }}"
-          SUMMARY="${{ steps.alert.outputs.summary }}"
-          EXTRA_LABELS="${{ inputs.extra-labels }}"
-
-          if [ "$CURRENT" != "unknown" ]; then
-            TITLE="Bump ${PACKAGE} from ${CURRENT} to ${PATCHED}"
-          else
-            TITLE="Bump ${PACKAGE} to ${PATCHED}"
-          fi
-
-          LABELS="dependencies"
-          if [ -n "$EXTRA_LABELS" ]; then
-            LABELS="${LABELS},${EXTRA_LABELS}"
-          fi
-
-          BODY=$(cat <<EOF
-          Fixes Dependabot alert #${ALERT_NUM}.
-
-          **${SEVERITY}**: ${SUMMARY}
-
-          Bumps [${PACKAGE}](https://github.com/advisories/${GHSA}) to \`${PATCHED}\` to resolve the vulnerability.
-
-          ---
-          *Created automatically by [auto-fix-alert](https://github.com/${{ github.repository }}) workflow.*
-          EOF
-          )
-
-          gh pr create \
-            --title "$TITLE" \
-            --body "$BODY" \
-            --label "$LABELS"
+            if (results.failed.length > 0) {
+              core.setFailed(`${results.failed.length} alert(s) failed to fix.`);
+            }
