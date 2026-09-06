@@ -1,0 +1,23 @@
+{
+  "name": "wong80",
+  "owner": {
+    "name": "wong80",
+    "url": "https://github.com/wong80"
+  },
+  "description": "Dependabot alerts plugin for Claude Code.",
+  "plugins": [
+    {
+      "name": "dependabot-alerts",
+      "source": "./",
+      "description": "Fetch, triage, and auto-fix Dependabot security alerts across your GitHub repos.",
+      "category": "engineering",
+      "keywords": [
+        "dependabot",
+        "security",
+        "alerts",
+        "dependencies",
+        "github"
+      ]
+    }
+  ]
+}
