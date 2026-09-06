@@ -1,0 +1,12 @@
+{
+  "name": "dependabot-alerts",
+  "version": "1.0.0",
+  "description": "Fetch, triage, and auto-fix Dependabot security alerts across your GitHub repos",
+  "author": "wong80",
+  "repository": "https://github.com/wong80/Dependabot-Alerts",
+  "keywords": ["dependabot", "security", "alerts", "dependencies", "github"],
+  "skills": [
+    "./skills/check-alerts",
+    "./skills/dependabot-fixer"
+  ]
+}

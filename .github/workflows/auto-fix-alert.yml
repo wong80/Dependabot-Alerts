@@ -1,0 +1,365 @@
+name: Auto-fix Dependabot Alert
+
+on:
+  workflow_call:
+    inputs:
+      severity-filter:
+        description: "Comma-separated severities to auto-fix (default: critical,high)"
+        required: false
+        type: string
+        default: "critical,high"
+      extra-labels:
+        description: "Comma-separated extra labels to add to the PR"
+        required: false
+        type: string
+        default: ""
+  dependabot_alert:
+    types: [created]
+
+permissions:
+  security_events: read
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: dependabot-auto-fix
+  cancel-in-progress: false
+
+jobs:
+  auto-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get alert details
+        id: alert
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const alert = context.payload.alert;
+            if (!alert) {
+              core.setFailed('No alert in event payload — this workflow must be triggered by a dependabot_alert event.');
+              return;
+            }
+
+            const severity = alert.security_vulnerability.severity;
+            const relationship = alert.dependency.relationship;
+            const patchedVersion = alert.security_vulnerability.first_patched_version;
+            const pkg = alert.dependency.package;
+            const manifest = alert.dependency.manifest_path;
+
+            core.setOutput('number', alert.number);
+            core.setOutput('severity', severity);
+            core.setOutput('relationship', relationship || 'unknown');
+            core.setOutput('package_name', pkg.name);
+            core.setOutput('ecosystem', pkg.ecosystem);
+            core.setOutput('manifest_path', manifest);
+            core.setOutput('patched_version', patchedVersion ? patchedVersion.identifier : '');
+            core.setOutput('vulnerable_range', alert.security_vulnerability.vulnerable_version_range);
+            core.setOutput('ghsa_id', alert.security_advisory.ghsa_id);
+            core.setOutput('summary', alert.security_advisory.summary);
+
+      - name: Check eligibility
+        id: eligible
+        run: |
+          SEVERITY="${{ steps.alert.outputs.severity }}"
+          RELATIONSHIP="${{ steps.alert.outputs.relationship }}"
+          PATCHED="${{ steps.alert.outputs.patched_version }}"
+          FILTER="${{ inputs.severity-filter || 'critical,high' }}"
+
+          # Check severity filter
+          if ! echo "$FILTER" | grep -qi "$SEVERITY"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "reason=Severity '$SEVERITY' not in filter '$FILTER'" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Check relationship (direct only)
+          if [ "$RELATIONSHIP" != "direct" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "reason=Transitive dependency — skipping auto-fix" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Check patched version exists
+          if [ -z "$PATCHED" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "reason=No patched version available" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Skip notification
+        if: steps.eligible.outputs.skip == 'true'
+        run: |
+          echo "::notice::Skipping alert #${{ steps.alert.outputs.number }}: ${{ steps.eligible.outputs.reason }}"
+
+      - name: Checkout repository
+        if: steps.eligible.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine branch name
+        if: steps.eligible.outputs.skip != 'true'
+        id: branch
+        run: |
+          ECOSYSTEM="${{ steps.alert.outputs.ecosystem }}"
+          PACKAGE="${{ steps.alert.outputs.package_name }}"
+          # Sanitize package name for branch (replace / with -)
+          SAFE_PACKAGE=$(echo "$PACKAGE" | tr '/' '-')
+          BRANCH="dependabot/${ECOSYSTEM}/${SAFE_PACKAGE}"
+
+          # Check if branch exists on remote
+          if git ls-remote --heads origin "$BRANCH" | grep -q .; then
+            BRANCH="${BRANCH}-fix"
+          fi
+
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Create fix branch
+        if: steps.eligible.outputs.skip != 'true'
+        run: |
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          git checkout -b "${{ steps.branch.outputs.name }}" "origin/${DEFAULT_BRANCH}"
+
+      - name: Setup Node.js
+        if: steps.eligible.outputs.skip != 'true' && steps.alert.outputs.ecosystem == 'npm'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      - name: Setup Python
+        if: steps.eligible.outputs.skip != 'true' && steps.alert.outputs.ecosystem == 'pip'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Setup Go
+        if: steps.eligible.outputs.skip != 'true' && steps.alert.outputs.ecosystem == 'gomod'
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Setup .NET
+        if: steps.eligible.outputs.skip != 'true' && steps.alert.outputs.ecosystem == 'nuget'
+        uses: actions/setup-dotnet@v4
+
+      - name: Setup Ruby
+        if: steps.eligible.outputs.skip != 'true' && steps.alert.outputs.ecosystem == 'rubygems'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 'ruby'
+
+      - name: Setup Java (Maven)
+        if: steps.eligible.outputs.skip != 'true' && steps.alert.outputs.ecosystem == 'maven'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Apply fix
+        if: steps.eligible.outputs.skip != 'true'
+        id: fix
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { execSync } = require('child_process');
+
+            const ecosystem = '${{ steps.alert.outputs.ecosystem }}';
+            const pkg = '${{ steps.alert.outputs.package_name }}';
+            const patchedVersion = '${{ steps.alert.outputs.patched_version }}';
+            const manifestPath = '${{ steps.alert.outputs.manifest_path }}';
+
+            const run = (cmd) => {
+              console.log(`> ${cmd}`);
+              try {
+                return execSync(cmd, { encoding: 'utf8', stdio: 'pipe' });
+              } catch (e) {
+                console.log(`Command failed: ${e.message}`);
+                return null;
+              }
+            };
+
+            let currentVersion = 'unknown';
+
+            switch (ecosystem) {
+              case 'npm': {
+                const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+                for (const section of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+                  if (manifest[section] && manifest[section][pkg]) {
+                    const existing = manifest[section][pkg];
+                    currentVersion = existing.replace(/^[\^~>=<\s]+/, '');
+                    const prefix = existing.match(/^([\^~])/)?.[1] || '^';
+                    manifest[section][pkg] = `${prefix}${patchedVersion}`;
+                  }
+                }
+                fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+                run('npm install');
+                break;
+              }
+
+              case 'pip': {
+                let content = fs.readFileSync(manifestPath, 'utf8');
+                const regex = new RegExp(`^(${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})([=<>!~]+)(.+)$`, 'mi');
+                const match = content.match(regex);
+                if (match) {
+                  currentVersion = match[3].trim();
+                  content = content.replace(regex, `$1>=${patchedVersion}`);
+                  fs.writeFileSync(manifestPath, content);
+                }
+                break;
+              }
+
+              case 'gomod': {
+                let content = fs.readFileSync(manifestPath, 'utf8');
+                const regex = new RegExp(`(${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})\\s+(v[\\d.]+)`, 'm');
+                const match = content.match(regex);
+                if (match) {
+                  currentVersion = match[2];
+                }
+                run(`go get ${pkg}@v${patchedVersion}`);
+                run('go mod tidy');
+                break;
+              }
+
+              case 'cargo': {
+                let content = fs.readFileSync(manifestPath, 'utf8');
+                const regex = new RegExp(`(${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*=\\s*(?:{[^}]*version\\s*=\\s*)?")([\\d.]+)(")`);
+                const match = content.match(regex);
+                if (match) {
+                  currentVersion = match[2];
+                  content = content.replace(regex, `$1${patchedVersion}$3`);
+                  fs.writeFileSync(manifestPath, content);
+                }
+                run(`cargo update -p ${pkg}`);
+                break;
+              }
+
+              case 'composer': {
+                const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+                for (const section of ['require', 'require-dev']) {
+                  if (manifest[section] && manifest[section][pkg]) {
+                    currentVersion = manifest[section][pkg].replace(/^[\^~>=<\s]+/, '');
+                    manifest[section][pkg] = `^${patchedVersion}`;
+                  }
+                }
+                fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 4) + '\n');
+                run('composer update --lock');
+                break;
+              }
+
+              case 'nuget': {
+                let content = fs.readFileSync(manifestPath, 'utf8');
+                const regex = new RegExp(`(<PackageReference\\s+Include="${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\s+Version=")([^"]+)(")`);
+                const match = content.match(regex);
+                if (match) {
+                  currentVersion = match[2];
+                  content = content.replace(regex, `$1${patchedVersion}$3`);
+                  fs.writeFileSync(manifestPath, content);
+                }
+                run('dotnet restore');
+                break;
+              }
+
+              case 'rubygems': {
+                let content = fs.readFileSync(manifestPath, 'utf8');
+                const regex = new RegExp(`(gem\\s+['"]${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]\\s*,\\s*['"][~>=<]+\\s*)([\\d.]+)(['"])`);
+                const match = content.match(regex);
+                if (match) {
+                  currentVersion = match[2];
+                  content = content.replace(regex, `$1${patchedVersion}$3`);
+                  fs.writeFileSync(manifestPath, content);
+                }
+                run('bundle install');
+                break;
+              }
+
+              case 'github-actions': {
+                let content = fs.readFileSync(manifestPath, 'utf8');
+                const regex = new RegExp(`(uses:\\s*${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}@)(\\S+)`);
+                const match = content.match(regex);
+                if (match) {
+                  currentVersion = match[2];
+                  const major = patchedVersion.split('.')[0];
+                  content = content.replace(regex, `$1v${major}`);
+                  fs.writeFileSync(manifestPath, content);
+                }
+                break;
+              }
+
+              default:
+                core.setFailed(`Unsupported ecosystem: ${ecosystem}`);
+                return;
+            }
+
+            core.setOutput('current_version', currentVersion);
+
+      - name: Commit and push
+        if: steps.eligible.outputs.skip != 'true'
+        run: |
+          PACKAGE="${{ steps.alert.outputs.package_name }}"
+          PATCHED="${{ steps.alert.outputs.patched_version }}"
+          CURRENT="${{ steps.fix.outputs.current_version }}"
+          BRANCH="${{ steps.branch.outputs.name }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::warning::No changes to commit — the dependency may already be at the patched version."
+            echo "no_changes=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$CURRENT" != "unknown" ]; then
+            git commit -m "Bump ${PACKAGE} from ${CURRENT} to ${PATCHED}"
+          else
+            git commit -m "Bump ${PACKAGE} to ${PATCHED}"
+          fi
+
+          git push -u origin "$BRANCH"
+
+      - name: Create pull request
+        if: steps.eligible.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PACKAGE="${{ steps.alert.outputs.package_name }}"
+          PATCHED="${{ steps.alert.outputs.patched_version }}"
+          CURRENT="${{ steps.fix.outputs.current_version }}"
+          ALERT_NUM="${{ steps.alert.outputs.number }}"
+          SEVERITY="${{ steps.alert.outputs.severity }}"
+          GHSA="${{ steps.alert.outputs.ghsa_id }}"
+          SUMMARY="${{ steps.alert.outputs.summary }}"
+          EXTRA_LABELS="${{ inputs.extra-labels }}"
+
+          if [ "$CURRENT" != "unknown" ]; then
+            TITLE="Bump ${PACKAGE} from ${CURRENT} to ${PATCHED}"
+          else
+            TITLE="Bump ${PACKAGE} to ${PATCHED}"
+          fi
+
+          LABELS="dependencies"
+          if [ -n "$EXTRA_LABELS" ]; then
+            LABELS="${LABELS},${EXTRA_LABELS}"
+          fi
+
+          BODY=$(cat <<EOF
+          Fixes Dependabot alert #${ALERT_NUM}.
+
+          **${SEVERITY}**: ${SUMMARY}
+
+          Bumps [${PACKAGE}](https://github.com/advisories/${GHSA}) to \`${PATCHED}\` to resolve the vulnerability.
+
+          ---
+          *Created automatically by [auto-fix-alert](https://github.com/${{ github.repository }}) workflow.*
+          EOF
+          )
+
+          gh pr create \
+            --title "$TITLE" \
+            --body "$BODY" \
+            --label "$LABELS"
