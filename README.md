@@ -5,7 +5,7 @@ A Claude Code plugin that fetches, triages, and fixes Dependabot security alerts
 ## What it does
 
 - **`/check-alerts`** — Scan a repo, org, or your current directory for open Dependabot alerts. Displays a prioritized table with severity, scope (runtime/dev), relationship (direct/transitive), and existing PR detection. Pick which alerts to fix and it creates branches, bumps dependencies, and opens PRs.
-- **Auto-fix workflow** — A reusable GitHub Actions workflow that fires on new Dependabot alerts and automatically creates fix PRs for critical/high direct dependencies.
+- **Auto-fix workflow** — A reusable GitHub Actions workflow that runs on a schedule (every 6 hours) or on demand, automatically creating fix PRs for critical/high direct dependencies.
 
 ## Prerequisites
 
@@ -132,8 +132,15 @@ Dependabot-Alerts/
 │       ├── SKILL.md             # Model-invoked single-alert fixer
 │       └── references/
 │           └── package-managers.md
+├── docs/
+│   └── agents/                  # Agent skill config
+│       ├── issue-tracker.md
+│       ├── triage-labels.md
+│       └── domain.md
+├── CLAUDE.md                    # Project instructions
 ├── CONTEXT.md                   # Domain glossary
-└── PLAN.md                      # Design decisions
+├── PLAN.md                      # Design decisions
+└── README.md
 ```
 
 ## License
