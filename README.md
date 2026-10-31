@@ -93,6 +93,11 @@ on:
 
 jobs:
   fix:
+    permissions:
+      contents: write
+      pull-requests: write
+      security-events: read
+      vulnerability-alerts: read
     uses: wong80/Dependabot-Alerts/.github/workflows/auto-fix-alert.yml@main
 ```
 
@@ -102,9 +107,10 @@ jobs:
 - Filters to critical/high severity, direct dependencies only, with a known patched version
 - Deduplicates by package (one PR per package)
 - Skips packages that already have a fix branch or PR open
+- Skips packages already at or above the patched version, because alerts can stay open after the fix lands
 - Creates a PR automatically — the PR is the review gate (no auto-merge)
 
-**Required permissions:** The calling repo's `GITHUB_TOKEN` must have `contents: write` and `pull-requests: write`. If your repo uses the default token permissions, you may need to update them under **Settings → Actions → General → Workflow permissions → Read and write permissions**.
+**Required permissions:** A called workflow can't give itself more access than its caller allows, so keep the `permissions:` block above on the calling job. You also need to turn on **Settings → Actions → General → Workflow permissions → Allow GitHub Actions to create and approve pull requests**, otherwise the workflow can push branches but can't open PRs.
 
 **Customization** via workflow inputs:
 
@@ -118,6 +124,11 @@ Example with custom inputs:
 ```yaml
 jobs:
   fix:
+    permissions:
+      contents: write
+      pull-requests: write
+      security-events: read
+      vulnerability-alerts: read
     uses: wong80/Dependabot-Alerts/.github/workflows/auto-fix-alert.yml@main
     with:
       severity-filter: "critical,high,medium"
@@ -170,9 +181,10 @@ Then retry `/check-alerts`. You can verify your scopes with `gh auth status`.
 
 ### `HTTP 403` when using the auto-fix workflow
 
-The workflow's `GITHUB_TOKEN` doesn't have write permissions.
+Check the error message in the failed run:
 
-**Fix:** Go to your repo's **Settings → Actions → General → Workflow permissions** and select **Read and write permissions**. The workflow needs `contents: write` and `pull-requests: write`.
+- **`Resource not accessible by integration` while fetching alerts:** the token can't read Dependabot alerts. Add `vulnerability-alerts: read` to the calling job's `permissions:` block, as shown in [Automated: GitHub Actions workflow](#automated-github-actions-workflow).
+- **`GitHub Actions is not permitted to create or approve pull requests`:** go to **Settings → Actions → General → Workflow permissions** and turn on **Allow GitHub Actions to create and approve pull requests**.
 
 ### `/check-alerts` doesn't appear in `/help`
 
@@ -230,7 +242,8 @@ Check the workflow run logs in your repo's **Actions** tab. Common reasons:
 
 1. **No eligible alerts** — only critical/high severity, direct dependencies with a known patched version qualify (by default)
 2. **PR already exists** — the workflow skips packages that already have an open PR or fix branch
-3. **Unsupported ecosystem** — the workflow currently handles npm, pip, Go, NuGet, and GitHub Actions in CI; other ecosystems are skipped
+3. **Already patched** — the alert is still open, but the default branch is already at or above the patched version
+4. **Unsupported ecosystem** — the workflow currently handles npm, pip, Go, NuGet, and GitHub Actions in CI; other ecosystems are skipped
 
 ### Auto-fix workflow doesn't trigger
 
